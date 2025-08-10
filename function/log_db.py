@@ -342,6 +342,7 @@ class LogDatabaseManager:
                 `user_id` varchar(255) NOT NULL COMMENT '用户ID',
                 `group_id` varchar(255) DEFAULT 'c2c' COMMENT '群聊ID',
                 `content` text NOT NULL COMMENT '消息内容',
+                `raw_message` text COMMENT '原始消息数据',
             """
         elif log_type == 'unmatched':
             specific_fields = """
@@ -354,6 +355,9 @@ class LogDatabaseManager:
             specific_fields = """
                 `content` text NOT NULL,
                 `traceback` text,
+                `resp_obj` text COMMENT '响应对象',
+                `send_payload` text COMMENT '发送载荷',
+                `raw_message` text COMMENT '原始消息',
             """
         else:
             specific_fields = """
@@ -443,14 +447,15 @@ class LogDatabaseManager:
         if log_type == 'received':
             sql = f"""
                 INSERT INTO `{table_name}` 
-                (timestamp, user_id, group_id, content) 
-                VALUES (%s, %s, %s, %s)
+                (timestamp, user_id, group_id, content, raw_message) 
+                VALUES (%s, %s, %s, %s, %s)
             """
             values = [(
                 log.get('timestamp'),
                 log.get('user_id', '未知用户'),
                 log.get('group_id', 'c2c'),
-                log.get('content')
+                log.get('content'),
+                log.get('raw_message', '')
             ) for log in logs]
             
         elif log_type == 'unmatched':
@@ -470,13 +475,16 @@ class LogDatabaseManager:
         elif log_type == 'error':
             sql = f"""
                 INSERT INTO `{table_name}` 
-                (timestamp, content, traceback) 
-                VALUES (%s, %s, %s)
+                (timestamp, content, traceback, resp_obj, send_payload, raw_message) 
+                VALUES (%s, %s, %s, %s, %s, %s)
             """
             values = [(
                 log.get('timestamp'),
                 log.get('content'),
-                log.get('traceback', '')
+                log.get('traceback', ''),
+                log.get('resp_obj', ''),
+                log.get('send_payload', ''),
+                log.get('raw_message', '')
             ) for log in logs]
         else:
             sql = f"""
@@ -548,14 +556,27 @@ class LogDatabaseManager:
                     timestamp = log.get('timestamp', '')
                     content = log.get('content', '')
                     f.write(f"[{timestamp}] {content}\n")
-                    if log_type == 'error' and 'traceback' in log:
-                        f.write(f"调用栈信息:\n{log['traceback']}\n")
+                    if log_type == 'error':
+                        if 'traceback' in log and log['traceback']:
+                            f.write(f"调用栈信息:\n{log['traceback']}\n")
+                        if 'resp_obj' in log and log['resp_obj']:
+                            f.write(f"响应对象:\n{log['resp_obj']}\n")
+                        if 'send_payload' in log and log['send_payload']:
+                            f.write(f"发送载荷:\n{log['send_payload']}\n")
+                        if 'raw_message' in log and log['raw_message']:
+                            f.write(f"原始消息:\n{log['raw_message']}\n")
+                    elif log_type == 'received':
+                        user_id = log.get('user_id', '未知用户')
+                        group_id = log.get('group_id', 'c2c')
+                        f.write(f"用户ID: {user_id}, 群聊ID: {group_id}\n")
+                        if 'raw_message' in log and log['raw_message']:
+                            f.write(f"原始消息: {log['raw_message']}\n")
                     elif log_type == 'unmatched':
                         user_id = log.get('user_id', '未知用户')
                         group_id = log.get('group_id', 'c2c')
                         f.write(f"用户ID: {user_id}, 群聊ID: {group_id}\n")
                         if 'raw_message' in log and log['raw_message']:
-                            f.write(f"原始消息: {log['raw_message'][:500]}...\n")
+                            f.write(f"原始消息: {log['raw_message']}\n")
             
         except Exception as e:
             logger.error(f"回退到文件保存失败: {str(e)}")

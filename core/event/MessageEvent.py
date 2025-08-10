@@ -81,7 +81,7 @@ class MessageEvent:
     # 特定错误码列表，被移出群聊或被禁言
     _IGNORE_ERROR_CODES = [11293, 40054002, 40054003]
 
-    def __init__(self, data):
+    def __init__(self, data, skip_recording=False):
         self.is_private = False
         self.is_group = False
         self.raw_data = data
@@ -90,13 +90,14 @@ class MessageEvent:
         self.content = ""
         self.message_type = self.UNKNOWN_MESSAGE
         self.event_type = self.get('t')
-        self.message_id = self.get('d/id')
+        self.message_id = self.get('id')
         self.timestamp = self.get('d/timestamp')
         self.matches = None
         self.db = Database()
         self.ignore = False
+        self.skip_recording = skip_recording  # 是否跳过数据库记录（用于测试等场景）
         self._parse_message()
-        if not self.ignore:
+        if not self.ignore and not self.skip_recording:
             self._record_user_and_group()
 
     # --- 消息解析相关 ---
@@ -227,9 +228,9 @@ class MessageEvent:
         if self.message_type in (self.GROUP_MESSAGE, self.DIRECT_MESSAGE):
             payload["msg_id"] = self.message_id
         elif self.message_type in (self.INTERACTION, self.GROUP_ADD_ROBOT):
-            payload["event_id"] = self.get('id') or self.get('d/id') or ""
+            payload["event_id"] = self.get('id') or ""
         elif self.message_type == self.CHANNEL_MESSAGE:
-            payload["msg_id"] = self.get('d/id')
+            payload["msg_id"] = self.get('id')
         return payload
     
     def _handle_auto_recall(self, message_id, auto_delete_time):
@@ -507,14 +508,18 @@ class MessageEvent:
                     else:
                         self._log_error(
                             f"发送{content_type}Token过期重试2次后仍然失败",
-                            f"{extra_info}\npayload: {json.dumps(payload, ensure_ascii=False)}\nraw_message: {json.dumps(self.raw_data, ensure_ascii=False, indent=2) if isinstance(self.raw_data, dict) else str(self.raw_data)}"
+                            tb=f"{extra_info}",
+                            send_payload=payload,
+                            raw_message=self.raw_data
                         )
                         return None
                 
                 # 其他错误码处理
                 self._log_error(
                     f"发送{content_type}失败：{resp_obj.get('message')} code：{error_code} trace_id：{resp_obj.get('trace_id')}", 
-                    f"resp_obj: {str(resp_obj)}\nsend_payload: {json.dumps(payload, ensure_ascii=False)}\nraw_message: {json.dumps(self.raw_data, ensure_ascii=False, indent=2) if isinstance(self.raw_data, dict) else str(self.raw_data)}"
+                    resp_obj=resp_obj,
+                    send_payload=payload,
+                    raw_message=self.raw_data
                 )
                 return MessageTemplate.send(self, MSG_TYPE_API_ERROR, error_code=error_code, 
                                            trace_id=resp_obj.get('trace_id'), endpoint=endpoint)
@@ -552,9 +557,9 @@ class MessageEvent:
         if self.message_type in (self.GROUP_MESSAGE, self.DIRECT_MESSAGE):
             payload["msg_id"] = self.message_id
         elif self.message_type in (self.INTERACTION, self.GROUP_ADD_ROBOT):
-            payload["event_id"] = self.get('id') or self.get('d/id') or ""
+            payload["event_id"] = self.get('id') or ""
         elif self.message_type == self.CHANNEL_MESSAGE:
-            payload["msg_id"] = self.get('d/id')
+            payload["msg_id"] = self.get('id')
         
         # 设置内容
         if media:
@@ -817,6 +822,40 @@ class MessageEvent:
         return f'https://gchat.qpic.cn/qmeetpic/0/0-0-{md5hash}/0'
 
     # --- 数据库与日志 ---
+    def _record_message_to_db(self):
+        """将消息记录到数据库中并推送web面板"""
+        self._record_message_to_db_only()
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._notify_web_display(timestamp)
+    
+    def _record_message_to_db_only(self):
+        """仅将消息记录到数据库中（不推送web面板）"""
+        from function.log_db import add_log_to_db
+        
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # 构建数据库条目
+        db_entry = {
+            'timestamp': timestamp,
+            'content': self.content or "",
+            'user_id': self.user_id or "未知用户",
+            'group_id': self.group_id or "c2c"
+        }
+        
+        # 保存原始消息（如果配置启用）
+        from config import SAVE_RAW_MESSAGE_TO_DB
+        if SAVE_RAW_MESSAGE_TO_DB:
+            db_entry['raw_message'] = json.dumps(self.raw_data, ensure_ascii=False, indent=2) if isinstance(self.raw_data, dict) else str(self.raw_data)
+        
+        # 保存到数据库
+        add_log_to_db('received', db_entry)
+
+    def _notify_web_display(self, timestamp):
+        """通知web面板显示消息"""
+        from web.app import add_display_message
+        formatted_message = f"{self.user_id}（{self.group_id}）：{self.content}" if self.group_id and self.group_id != "c2c" else f"{self.user_id}：{self.content}"
+        add_display_message(formatted_message, timestamp)
+
     def _record_user_and_group(self):
         user_is_new = False
         
@@ -840,12 +879,24 @@ class MessageEvent:
             except Exception as e:
                 self._log_error(f'新用户欢迎消息发送失败: {str(e)}')
 
-    def _log_error(self, msg, tb=None):
+    def _log_error(self, msg, tb=None, resp_obj=None, send_payload=None, raw_message=None):
         log_data = {
             'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'content': msg,
             'traceback': tb or traceback.format_exc()
         }
+        
+        # 仅限错误类型添加分开的字段
+        if resp_obj is not None:
+            log_data['resp_obj'] = str(resp_obj)
+        if send_payload is not None:
+            log_data['send_payload'] = json.dumps(send_payload, ensure_ascii=False, indent=2)
+        if raw_message is not None:
+            if isinstance(raw_message, dict):
+                log_data['raw_message'] = json.dumps(raw_message, ensure_ascii=False, indent=2)
+            else:
+                log_data['raw_message'] = str(raw_message)
+        
         add_log_to_db('error', log_data)
         add_error_log(msg, tb or traceback.format_exc())
 
